@@ -1,8 +1,6 @@
 module github.com/xtls/RealiTLScanner
 
-go 1.22.0
-
-toolchain go1.23.6
+go 1.23
 
 require github.com/oschwald/geoip2-golang v1.11.0
 

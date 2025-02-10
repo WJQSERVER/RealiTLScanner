@@ -1,8 +1,11 @@
 # Reality - TLS - Scanner
 
-## Building
+## 对比原版的改动：
 
-Requirement: Go 1.21+
+使用utls库并使用chrome预设, 缓解部分特征
+经测试, 对结果的影响不大, x25519加密算法也已广泛支持
+
+## Building
 
 ```bash
 go build
