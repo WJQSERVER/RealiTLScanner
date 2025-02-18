@@ -6,3 +6,5 @@ in.txt
 out.txt
 out.csv
 Country.mmdb
+test
+*.csv

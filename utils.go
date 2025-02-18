@@ -1,226 +1,347 @@
 package main
 
 import (
-	"bufio"     // 提供带缓冲的 I/O
-	"errors"    // 错误处理
-	"fmt"       // 格式化 I/O
-	"io"        // 基本 I/O 功能
-	"log/slog"  // 日志记录
-	"math"      // 数学常量和函数
-	"math/big"  // 大整数计算
-	"net"       // 网络操作
-	"net/netip" // 网络 IP 操作
-	"regexp"    // 正则表达式操作
-	"strings"   // 字符串处理
+	"bufio"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"math"
+	"net"
+	"net/netip"
+	"os"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
 )
 
-// 定义主机类型常量
 const (
-	_              = iota // 忽略第一个常量的值
-	HostTypeIP            // 主机类型为 IP
-	HostTypeCIDR          // 主机类型为 CIDR
-	HostTypeDomain        // 主机类型为域名
+	_ = iota
+	HostTypeIP
+	HostTypeCIDR
+	HostTypeDomain
 )
 
-// 定义 HostType 类型
 type HostType int
 
-// 定义 Host 结构体，表示一个主机的信息
 type Host struct {
-	IP     net.IP   // 主机的 IP 地址
-	Origin string   // 原始输入（IP、CIDR 或域名）
-	Type   HostType // 主机类型
+	IP     netip.Addr
+	Origin string
+	Type   HostType
 }
 
-// Iterate 函数从给定的 io.Reader 读取主机信息并返回一个通道
-func Iterate(reader io.Reader) <-chan Host {
-	scanner := bufio.NewScanner(reader) // 创建扫描器
-	hostChan := make(chan Host)         // 创建主机通道
+// Iterate reads host information and returns a channel of Hosts.
+func Iterate(reader io.Reader, enableIPv6 bool) <-chan Host {
+	scanner := bufio.NewScanner(reader)
+	hostChan := make(chan Host)
 	go func() {
-		defer close(hostChan) // 确保在函数结束时关闭通道
+		defer close(hostChan)
 		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text()) // 去除行首尾空白
+			line := strings.TrimSpace(scanner.Text())
 			if line == "" {
-				continue // 忽略空行
-			}
-			ip := net.ParseIP(line) // 尝试解析 IP
-			if ip != nil && (ip.To4() != nil || enableIPv6) {
-				// 如果是有效的 IP 地址
-				hostChan <- Host{
-					IP:     ip,
-					Origin: line,
-					Type:   HostTypeIP,
-				}
 				continue
 			}
-			_, _, err := net.ParseCIDR(line) // 检查是否为 CIDR
-			if err == nil {
-				// 处理 CIDR
-				p, err := netip.ParsePrefix(line) // 解析 CIDR 前缀
-				if err != nil {
-					slog.Warn("Invalid cidr", "cidr", line, "err", err)
-				}
+
+			if ip, err := netip.ParseAddr(line); err == nil && (ip.Is4() || enableIPv6) {
+				hostChan <- Host{IP: ip, Origin: line, Type: HostTypeIP}
+				continue
+			}
+
+			if p, err := netip.ParsePrefix(line); err == nil {
 				if !p.Addr().Is4() && !enableIPv6 {
-					continue // 如果不是 IPv4 且未启用 IPv6，跳过
+					continue
 				}
-				p = p.Masked()   // 获取掩码的前缀
-				addr := p.Addr() // 获取地址
-				for {
-					if !p.Contains(addr) {
-						break // 如果地址不在前缀中，退出循环
+				ipMap := make(map[netip.Addr]bool)
+				for addr := p.Addr(); p.Contains(addr); addr = addr.Next() {
+					if ip, err := netip.ParseAddr(addr.String()); err == nil {
+						ipMap[ip] = true
 					}
-					ip = net.ParseIP(addr.String()) // 解析地址
-					if ip != nil {
-						hostChan <- Host{
-							IP:     ip,
-							Origin: line,
-							Type:   HostTypeCIDR,
-						}
-					}
-					addr = addr.Next() // 获取下一个地址
 				}
+				var wg sync.WaitGroup
+				ipChan := make(chan netip.Addr)
+				go func() {
+					defer close(ipChan)
+					for ip := range ipMap {
+						ipChan <- ip
+					}
+				}()
+				for ip := range ipChan {
+					wg.Add(1)
+					go func(currentIP netip.Addr) {
+						defer wg.Done()
+						hostChan <- Host{IP: currentIP, Origin: line, Type: HostTypeCIDR}
+					}(ip)
+				}
+				wg.Wait()
 				continue
+
 			}
+
 			if ValidateDomainName(line) {
-				// 如果是有效的域名
-				hostChan <- Host{
-					IP:     nil,
-					Origin: line,
-					Type:   HostTypeDomain,
-				}
+				hostChan <- Host{IP: netip.Addr{}, Origin: line, Type: HostTypeDomain}
 				continue
 			}
-			slog.Warn("Not a valid IP, IP CIDR or domain", "line", line) // 无效输入
+
+			slog.Warn("Invalid input line", "line", line, "reason", "not a valid IP, CIDR, or domain")
 		}
+
 		if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
-			slog.Error("Read file error", "err", err) // 读取错误
+			slog.Error("File scanner error", "error", err)
 		}
 	}()
-	return hostChan // 返回主机通道
+	return hostChan
 }
 
-// ValidateDomainName 函数用于验证域名的有效性
+// ValidateDomainName uses regex to validate domain names.
 func ValidateDomainName(domain string) bool {
-	r := regexp.MustCompile(`(?m)^[A-Za-z0-9\-.]+$`) // 正则表达式匹配域名
-	return r.MatchString(domain)                     // 返回是否匹配
+	domainRegex := regexp.MustCompile(`(?m)^[A-Za-z0-9\-.]+$`)
+	return domainRegex.MatchString(domain)
 }
 
-// ExistOnlyOne 函数检查字符串数组中是否仅存在一个非空字符串
+// ExistOnlyOne checks if exactly one non-empty string exists in the given slice.
 func ExistOnlyOne(arr []string) bool {
-	exist := false
+	nonEmptyCount := 0
 	for _, item := range arr {
 		if item != "" {
-			if exist {
-				return false // 如果存在多个非空字符串，返回 false
-			} else {
-				exist = true
-			}
+			nonEmptyCount++
 		}
 	}
-	return exist // 返回是否存在一个非空字符串
+	return nonEmptyCount == 1
 }
 
-// IterateAddr 函数处理输入的地址并返回一个主机通道
-func IterateAddr(addr string) <-chan Host {
-	hostChan := make(chan Host)      // 创建主机通道
-	_, _, err := net.ParseCIDR(addr) // 检查是否为 CIDR
-	if err == nil {
-		// 如果是 CIDR
-		return Iterate(strings.NewReader(addr)) // 调用 Iterate 函数
+// IterateAddr handles single address input, including infinite IP mode.
+func IterateAddr(addr string, enableIPv6 bool) <-chan Host {
+	hostChan := make(chan Host)
+
+	if _, _, err := net.ParseCIDR(addr); err == nil {
+		return Iterate(strings.NewReader(addr), enableIPv6)
 	}
-	ip := net.ParseIP(addr) // 尝试解析 IP
-	if ip == nil {
-		ip, err = LookupIP(addr) // 如果解析失败，查找 IP
-		if err != nil {
-			close(hostChan) // 关闭通道
-			slog.Error("Not a valid IP, IP CIDR or domain", "addr", addr)
-			return hostChan // 返回通道
-		}
+
+	ip, err := LookupIP(addr, enableIPv6)
+	if err != nil {
+		close(hostChan)
+		slog.Error("Invalid address input", "address", addr, "error", err)
+		return hostChan
 	}
+
 	go func() {
-		slog.Info("Enable infinite mode", "init", ip.String())
-		lowIP := ip  // 初始化低 IP
-		highIP := ip // 初始化高 IP
-		hostChan <- Host{
-			IP:     ip,
-			Origin: addr,
-			Type:   HostTypeIP,
-		}
+		defer close(hostChan)
+		slog.Info("Infinite mode enabled", "initial_ip", ip.String())
+		lowIP := ip
+		highIP := ip
+
+		hostChan <- Host{IP: ip, Origin: addr, Type: HostTypeIP}
+
 		for i := 0; i < math.MaxInt; i++ {
 			if i%2 == 0 {
-				lowIP = NextIP(lowIP, false) // 获取下一个低 IP
-				hostChan <- Host{
-					IP:     lowIP,
-					Origin: lowIP.String(),
-					Type:   HostTypeIP,
-				}
+				lowIP = NextIP(lowIP, false)
 			} else {
-				highIP = NextIP(highIP, true) // 获取下一个高 IP
-				hostChan <- Host{
-					IP:     highIP,
-					Origin: highIP.String(),
-					Type:   HostTypeIP,
-				}
+				highIP = NextIP(highIP, true)
+			}
+			select {
+			case hostChan <- Host{IP: lowIP, Origin: lowIP.String(), Type: HostTypeIP}:
+			case hostChan <- Host{IP: highIP, Origin: highIP.String(), Type: HostTypeIP}:
+			default:
 			}
 		}
 	}()
-	return hostChan // 返回主机通道
+	return hostChan
 }
 
-// LookupIP 函数根据地址查找 IP
-func LookupIP(addr string) (net.IP, error) {
-	ips, err := net.LookupIP(addr) // 查找 IP
+// LookupIP resolves hostname to netip.Addr.
+func LookupIP(addr string, enableIPv6 bool) (netip.Addr, error) {
+	ips, err := net.LookupIP(addr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to lookup: %w", err)
+		return netip.Addr{}, fmt.Errorf("lookup failed for address '%s': %w", addr, err)
 	}
-	var arr []net.IP
+
+	var validIPs []netip.Addr
 	for _, ip := range ips {
-		if ip.To4() != nil || enableIPv6 {
-			arr = append(arr, ip) // 仅添加有效的 IP
+		if ip4 := ip.To4(); ip4 != nil {
+			if parsedIP, err := netip.ParseAddr(ip4.String()); err == nil {
+				validIPs = append(validIPs, parsedIP)
+			}
+		} else if enableIPv6 {
+			if parsedIP, err := netip.ParseAddr(ip.String()); err == nil {
+				validIPs = append(validIPs, parsedIP)
+			}
 		}
 	}
-	if len(arr) == 0 {
-		return nil, errors.New("no IP found") // 如果没有找到 IP，返回错误
+
+	if len(validIPs) == 0 {
+		return netip.Addr{}, fmt.Errorf("no valid IP address found for '%s' (IPv6 enabled: %t)", addr, enableIPv6)
 	}
-	return arr[0], nil // 返回找到的第一个 IP
+	return validIPs[0], nil
 }
 
-// RemoveDuplicateStr 函数用于去除字符串切片中的重复项
+// RemoveDuplicateStr removes duplicate strings from a slice.
 func RemoveDuplicateStr(strSlice []string) []string {
-	allKeys := make(map[string]bool) // 创建映射以跟踪唯一项
-	var list []string
+	seen := make(map[string]bool)
+	result := []string{}
 	for _, item := range strSlice {
-		if _, value := allKeys[item]; !value {
-			allKeys[item] = true      // 标记为唯一
-			list = append(list, item) // 添加到结果列表
+		if _, ok := seen[item]; !ok {
+			seen[item] = true
+			result = append(result, item)
 		}
 	}
-	return list // 返回去重后的列表
+	return result
 }
 
-// OutWriter 函数创建一个写入通道
-func OutWriter(writer io.Writer) chan<- string {
-	ch := make(chan string) // 创建通道
+// ByIP implements sort.Interface for []ScanResult based on IP address.
+type ByIP []ScanResult
+
+func (a ByIP) Len() int      { return len(a) }
+func (a ByIP) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
+func (a ByIP) Less(i, j int) bool {
+	ip1, _ := netip.ParseAddr(a[i].IP)
+	ip2, _ := netip.ParseAddr(a[j].IP)
+	return ip1.Less(ip2)
+}
+
+// OutWriterJSON creates output writer channel and writes JSON output.
+func OutWriterJSON(writer io.Writer) chan<- ScanResult {
+	outputChan := make(chan ScanResult)
 	go func() {
-		for s := range ch {
-			_, _ = io.WriteString(writer, s) // 写入字符串
+		defer slog.Info("JSON 输出写入器已关闭")
+		bufWriter := bufio.NewWriter(writer)
+		defer func() {
+			if err := bufWriter.Flush(); err != nil {
+				slog.Error("刷新 JSON 输出缓冲区错误", "error", err)
+			}
+		}()
+
+		results := []ScanResult{}
+		for result := range outputChan {
+			slog.Debug("接收到结果", "result", result)
+			results = append(results, result)
+		}
+
+		// 排序结果
+		sort.Sort(ByIP(results))
+
+		// 编码为 JSON
+		encoder := json.NewEncoder(bufWriter)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(results); err != nil {
+			slog.Error("JSON 编码错误", "error", err)
 		}
 	}()
-	return ch // 返回写入通道
+	return outputChan
 }
 
-// NextIP 函数返回下一个 IP 地址
-func NextIP(ip net.IP, increment bool) net.IP {
-	// 将 IP 转换为 big.Int 并增量
-	ipb := big.NewInt(0).SetBytes(ip)
+// OutWriterReadable creates output writer channel and writes human-readable output.
+func OutWriterReadable(writer io.Writer) chan<- ScanResult {
+	outputChan := make(chan ScanResult)
+	go func() {
+		defer slog.Info("易读文本输出写入器已关闭")
+		bufWriter := bufio.NewWriter(writer)
+		defer func() {
+			err := bufWriter.Flush()
+			if err != nil {
+				slog.Error("刷新易读文本输出缓冲区错误 (defer)", "error", err) // defer 中的 flush 也添加日志
+			} else {
+				slog.Debug("刷新易读文本输出缓冲区成功 (defer)") // defer 中的 flush 成功日志
+			}
+		}()
+
+		var results []ScanResult
+		for result := range outputChan {
+			slog.Debug("OutWriterReadable 接收到结果", "ip", result.IP)
+			results = append(results, result)
+		}
+		sort.Sort(ByIP(results))
+
+		logWrite := func(s string) { // 定义一个内部函数，简化日志记录
+			_, err := bufWriter.WriteString(s)
+			if err != nil {
+				slog.Error("WriteString 错误", "error", err)
+			} else {
+				slog.Debug("WriteString 成功", "content", strings.TrimSpace(s)) // 记录写入内容 (去除首尾空格)
+			}
+		}
+
+		logWrite("TLS 扫描结果:\n\n") // 使用 logWrite 写入总标题
+
+		for _, res := range results {
+			logWrite("------------------------------------\n")
+			logWrite(fmt.Sprintf("IP 地址:         %s\n", res.IP))
+			logWrite(fmt.Sprintf("原始输入:       %s\n", res.Origin))
+			logWrite(fmt.Sprintf("证书域名:       %s\n", res.Domain))
+			logWrite(fmt.Sprintf("证书颁发者:     %s\n", res.Issuers))
+			logWrite(fmt.Sprintf("地理位置代码:   %s\n", res.GeoCode))
+			logWrite(fmt.Sprintf("是否可行:       %t\n", res.Feasible))
+			logWrite(fmt.Sprintf("TLS 版本:       %s\n", res.TLSVersion))
+			logWrite(fmt.Sprintf("ALPN 协议:      %s\n", res.ALPN))
+			logWrite("------------------------------------\n")
+		}
+		logWrite("\n扫描完成，详细结果如上。\n") // 使用 logWrite 写入结尾语
+		err := bufWriter.Flush()     // 显式 Flush，并添加日志
+		if err != nil {
+			slog.Error("刷新易读文本输出缓冲区错误 (显式)", "error", err)
+		} else {
+			slog.Debug("刷新易读文本输出缓冲区成功 (显式)")
+		}
+		slog.Debug("易读文本输出完成，写入文件")
+	}()
+	return outputChan
+}
+
+// NextIP calculates next IP address (increment/decrement for netip.Addr).
+func NextIP(ip netip.Addr, increment bool) netip.Addr {
+	ipBytes := ip.As4()
+	ipInt := uint32(ipBytes[0])<<24 | uint32(ipBytes[1])<<16 | uint32(ipBytes[2])<<8 | uint32(ipBytes[3])
+
 	if increment {
-		ipb.Add(ipb, big.NewInt(1)) // 增加 1
+		ipInt++
 	} else {
-		ipb.Sub(ipb, big.NewInt(1)) // 减少 1
+		ipInt--
 	}
 
-	// 添加前导零
-	b := ipb.Bytes()
-	b = append(make([]byte, len(ip)-len(b)), b...) // 确保字节长度一致
-	return b                                       // 返回新的 IP 地址
+	newIPBytes := make(net.IP, net.IPv4len)
+	newIPBytes[0] = byte(ipInt >> 24)
+	newIPBytes[1] = byte(ipInt >> 16)
+	newIPBytes[2] = byte(ipInt >> 8)
+	newIPBytes[3] = byte(ipInt)
+
+	if parsedIP, err := netip.ParseAddr(newIPBytes.String()); err == nil {
+		return parsedIP
+	}
+	return netip.Addr{}
+}
+
+// 初始化输出写入器
+func InitOutputWriter(outputFilePrefix, outputFormat string) (chan<- ScanResult, func(), error) {
+	var writer io.Writer
+	var closeFunc func() = func() {} // 默认空的关闭函数
+
+	if outputFilePrefix != "" {
+		var file *os.File
+		var err error
+		if outputFormat == "json" {
+			file, err = os.OpenFile(outputFilePrefix+".json", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0777)
+		} else if outputFormat == "readable" {
+			file, err = os.OpenFile(outputFilePrefix+".txt", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0777)
+		} else {
+			return nil, nil, fmt.Errorf("不支持的输出格式: %s", outputFormat)
+		}
+
+		if err != nil {
+			return nil, nil, fmt.Errorf("无法打开输出文件: %v", err)
+		}
+
+		writer = file
+		closeFunc = func() { file.Close() }
+	} else {
+		writer = os.Stdout // 默认输出到标准输出
+	}
+
+	if outputFormat == "json" {
+		return OutWriterJSON(writer), closeFunc, nil
+	} else if outputFormat == "readable" {
+		return OutWriterReadable(writer), closeFunc, nil
+	}
+
+	return nil, nil, fmt.Errorf("未知的输出格式: %s", outputFormat)
 }

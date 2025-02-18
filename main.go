@@ -1,136 +1,288 @@
 package main
 
 import (
-	"flag"     // 用于解析命令行参数
-	"io"       // 提供基本的输入输出功能
-	"log/slog" // 日志记录
-	"net/http" // HTTP 客户端
-	"os"       // 操作系统功能
-	"regexp"   // 正则表达式操作
-	"strings"  // 字符串处理
-	"sync"     // 处理并发
-	"time"     // 时间处理
+	"flag"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"os"
+	"regexp"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
 )
 
-// 定义全局变量用于存储命令行参数
-var addr string
-var in string
-var port int
-var thread int
-var out string
-var timeout int
-var verbose bool
-var enableIPv6 bool
-var url string
+// 定义命令行标志
+var (
+	addressFlag      string
+	inputFileFlag    string
+	portFlag         int
+	threadFlag       int
+	outputFileFlag   string
+	timeoutFlag      int
+	verboseFlag      bool
+	enableIPv6Flag   bool
+	urlFlag          string
+	chromeAutoFlag   bool
+	outputFormatFlag string // 新增输出格式标志
+)
 
+func init() {
+	flag.StringVar(&addressFlag, "addr", "", "指定 IP, IP CIDR 或域名进行扫描")
+	flag.StringVar(&inputFileFlag, "in", "", "包含 IP, CIDR 或域名的文件路径")
+	flag.IntVar(&portFlag, "port", 443, "HTTPS 端口")
+	flag.IntVar(&threadFlag, "thread", runtime.NumCPU(), "并发任务数 (默认: CPU 核心数)")
+	flag.StringVar(&outputFileFlag, "out", "out", "输出文件名前缀 (不包含扩展名)") // 修改默认输出文件名前缀
+	flag.IntVar(&timeoutFlag, "timeout", 10, "每次检查的超时秒数")
+	flag.BoolVar(&verboseFlag, "v", false, "详细输出 (debug 日志)")
+	flag.BoolVar(&enableIPv6Flag, "46", false, "启用 IPv6 扫描")
+	flag.StringVar(&urlFlag, "url", "", "从 URL 抓取域名列表")
+	flag.BoolVar(&chromeAutoFlag, "chrome-auto", true, "TLS 握手使用 HelloChrome_Auto")
+	flag.StringVar(&outputFormatFlag, "format", "json", "输出格式 (json, readable)") // 新增输出格式选项
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "%s 使用方法:\n", os.Args[0])
+		fmt.Fprintln(os.Stderr, "TLS 扫描器，用于识别具有特定配置的服务器。")
+		fmt.Fprintln(os.Stderr, "\n选项:")
+		flag.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "\n例子:")
+		fmt.Fprintln(os.Stderr, "  扫描单个 IP: go run main.go -addr 1.1.1.1 -format json -out results")
+		fmt.Fprintln(os.Stderr, "  从文件扫描 IP 列表: go run main.go -in hosts.txt -thread 10 -format readable -out detailed_results")
+		fmt.Fprintln(os.Stderr, "  扫描 URL 域名: go run main.go -url https://example.com -format json -out domains")
+	}
+}
+
+/*
 func main() {
-	// 清除环境变量，确保不受代理影响
-	_ = os.Unsetenv("ALL_PROXY")
-	_ = os.Unsetenv("HTTP_PROXY")
-	_ = os.Unsetenv("HTTPS_PROXY")
-	_ = os.Unsetenv("NO_PROXY")
+	flag.Parse()
 
-	// 定义命令行参数
-	flag.StringVar(&addr, "addr", "", "Specify an IP, IP CIDR or domain to scan")
-	flag.StringVar(&in, "in", "", "Specify a file that contains multiple "+
-		"IPs, IP CIDRs or domains to scan, divided by line break")
-	flag.IntVar(&port, "port", 443, "Specify a HTTPS port to check")
-	flag.IntVar(&thread, "thread", 2, "Count of concurrent tasks")
-	flag.StringVar(&out, "out", "out.csv", "Output file to store the result")
-	flag.IntVar(&timeout, "timeout", 10, "Timeout for every check")
-	flag.BoolVar(&verbose, "v", false, "Verbose output")
-	flag.BoolVar(&enableIPv6, "46", false, "Enable IPv6 in additional to IPv4")
-	flag.StringVar(&url, "url", "", "Crawl the domain list from a URL, "+
-		"e.g. https://launchpad.net/ubuntu/+archivemirrors")
-	flag.Parse() // 解析命令行参数
-
-	// 设置日志级别
-	if verbose {
-		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-			Level: slog.LevelDebug, // 调试模式
-		})))
-	} else {
-		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-			Level: slog.LevelInfo, // 信息模式
-		})))
+	// 清除代理环境变量
+	envVars := []string{"ALL_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"}
+	for _, envVar := range envVars {
+		_ = os.Unsetenv(envVar)
 	}
 
-	// 检查输入的参数，确保只提供一个
-	if !ExistOnlyOne([]string{addr, in, url}) {
-		slog.Error("You must specify and only specify one of `addr`, `in`, or `url`")
-		flag.PrintDefaults() // 打印命令行参数的默认值
-		return
+	// 配置日志
+	logLevel := slog.LevelInfo
+	if verboseFlag {
+		logLevel = slog.LevelDebug
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel})))
+
+	// 验证输入源
+	inputSources := []string{addressFlag, inputFileFlag, urlFlag}
+	if !ExistOnlyOne(inputSources) {
+		slog.Error("请仅指定 -addr, -in, 或 -url 中的一个")
+		flag.Usage()
+		os.Exit(1)
 	}
 
-	// 设置输出文件
-	outWriter := io.Discard // 默认丢弃输出
-	if out != "" {
-		f, err := os.OpenFile(out, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644) // 创建或打开输出文件
-		if err != nil {
-			slog.Error("Error opening file", "path", out)
-			return
+	// 输出写入器设置
+	var outChannel chan<- ScanResult
+	var jsonFile io.Writer
+	var readableFile io.Writer
+
+	if outputFileFlag != "" {
+		if outputFormatFlag == "json" {
+			f, err := os.OpenFile(outputFileFlag+".json", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0777)
+			if err != nil {
+				slog.Error("打开 JSON 输出文件错误", "path", outputFileFlag+".json", "error", err)
+				os.Exit(1)
+			}
+			defer f.Close()
+			jsonFile = f
+			outChannel = OutWriterJSON(jsonFile) // 使用 JSON 输出写入器
+		} else if outputFormatFlag == "readable" {
+			f, err := os.OpenFile(outputFileFlag+".txt", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0777)
+			if err != nil {
+				slog.Error("打开易读文本输出文件错误", "path", outputFileFlag+".txt", "error", err)
+				os.Exit(1)
+			}
+			defer f.Close()
+			readableFile = f
+			outChannel = OutWriterReadable(readableFile) // 使用易读文本输出写入器
+		} else {
+			slog.Error("不支持的输出格式", "format", outputFormatFlag)
+			flag.Usage()
+			os.Exit(1)
 		}
-		defer f.Close()                                                      // 确保在函数结束时关闭文件
-		_, _ = f.WriteString("IP,ORIGIN,CERT_DOMAIN,CERT_ISSUER,GEO_CODE\n") // 写入CSV头部
-		outWriter = f                                                        // 设置输出写入器
+	} else {
+		outChannel = OutWriterJSON(io.Discard) // 默认丢弃输出，但初始化 JSON 输出写入器以避免空指针
+		readableFile = io.Discard
+		jsonFile = io.Discard
 	}
+	defer close(outChannel)
 
-	// 根据输入的参数选择处理方式
+	// 主机输入 channel 设置
 	var hostChan <-chan Host
-	if addr != "" {
-		hostChan = IterateAddr(addr) // 处理单个地址
-	} else if in != "" {
-		f, err := os.Open(in) // 打开包含多个地址的文件
+	switch {
+	case addressFlag != "":
+		hostChan = IterateAddr(addressFlag, enableIPv6Flag)
+	case inputFileFlag != "":
+		f, err := os.Open(inputFileFlag)
 		if err != nil {
-			slog.Error("Error reading file", "path", in)
-			return
+			slog.Error("打开输入文件错误", "path", inputFileFlag, "error", err)
+			os.Exit(1)
 		}
 		defer f.Close()
-		hostChan = Iterate(f) // 迭代文件中的地址
-	} else {
-		slog.Info("Fetching url...") // 从URL获取域名
-		resp, err := http.Get(url)
+		hostChan = Iterate(f, enableIPv6Flag)
+	case urlFlag != "":
+		slog.Info("从 URL 获取域名列表", "url", urlFlag)
+		resp, err := http.Get(urlFlag)
 		if err != nil {
-			slog.Error("Error fetching url", "err", err)
-			return
+			slog.Error("HTTP 请求失败", "url", urlFlag, "error", err)
+			os.Exit(1)
 		}
-		defer resp.Body.Close()         // 确保在函数结束时关闭响应体
-		v, err := io.ReadAll(resp.Body) // 读取响应体
+		defer resp.Body.Close()
+		bodyBytes, err := io.ReadAll(resp.Body)
 		if err != nil {
-			slog.Error("Error reading body", "err", err)
-			return
+			slog.Error("读取响应体失败", "url", urlFlag, "error", err)
+			os.Exit(1)
 		}
-		// 输出响应状态码和内容
-		slog.Info("Fetched url", "status", resp.StatusCode, "body", string(v))
-		// 使用正则表达式提取域名
-		arr := regexp.MustCompile("(http|https)://(.*?)[/\"<>\\s]+").FindAllStringSubmatch(string(v), -1)
+		slog.Debug("URL 响应", "status", resp.StatusCode, "body_length", len(bodyBytes))
+
+		domainRegex := regexp.MustCompile(`(http|https)://(.*?)[/"<>\s]+`)
+		matches := domainRegex.FindAllStringSubmatch(string(bodyBytes), -1)
 		var domains []string
-		for _, m := range arr {
-			domains = append(domains, m[2]) // 提取域名部分
+		for _, match := range matches {
+			domains = append(domains, match[2])
 		}
-		domains = RemoveDuplicateStr(domains) // 去重
-		slog.Info("Parsed domains", "count", len(domains))
-		hostChan = Iterate(strings.NewReader(strings.Join(domains, "\n"))) // 将域名转为输入流
+		domains = RemoveDuplicateStr(domains)
+		slog.Info("从 URL 解析域名", "count", len(domains))
+		hostChan = Iterate(strings.NewReader(strings.Join(domains, "\n")), enableIPv6Flag)
+	default:
+		slog.Error("未指定输入源")
+		flag.Usage()
+		os.Exit(1)
 	}
 
-	outCh := OutWriter(outWriter) // 创建输出通道
-	defer close(outCh)            // 确保在函数结束时关闭通道
-	geo := NewGeo()               // 创建地理位置对象
-	var wg sync.WaitGroup         // 创建 WaitGroup 用于等待所有协程完成
-	wg.Add(thread)                // 设置等待的协程数量
+	geoData := NewGeo()
 
-	// 启动多个协程进行扫描
-	for i := 0; i < thread; i++ {
+	var wg sync.WaitGroup
+	wg.Add(threadFlag)
+
+	tlsSettings := TLSSettings{
+		Timeout:         timeoutFlag,
+		Port:            portFlag,
+		EnableIPv6:      enableIPv6Flag,
+		ChromeAutoHello: chromeAutoFlag,
+	}
+
+	slog.Info("开始 TLS 扫描", "threads", threadFlag, "timeout", timeoutFlag, "port", portFlag, "output", outputFileFlag, "format", outputFormatFlag)
+	startTime := time.Now()
+
+	for i := 0; i < threadFlag; i++ {
 		go func() {
-			for ip := range hostChan {
-				ScanTLS(ip, outCh, geo) // 执行 TLS 扫描
+			defer wg.Done()
+			for host := range hostChan {
+				ScanTLS(host, outChannel, geoData, tlsSettings)
 			}
-			wg.Done() // 完成协程的工作
 		}()
 	}
 
-	t := time.Now() // 记录开始时间
-	slog.Info("Started all scanning threads", "time", t)
-	wg.Wait()                                                                              // 等待所有协程完成
-	slog.Info("Scanning completed", "time", time.Now(), "elapsed", time.Since(t).String()) // 输出完成信息和耗时
+	wg.Wait()
+	elapsedTime := time.Since(startTime)
+	slog.Info("TLS 扫描完成", "耗时", elapsedTime.String())
+}
+*/
+
+func main() {
+	flag.Parse()
+
+	// 配置日志
+	logLevel := slog.LevelInfo
+	if verboseFlag {
+		logLevel = slog.LevelDebug
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel})))
+
+	// 验证输入源
+	inputSources := []string{addressFlag, inputFileFlag, urlFlag}
+	if !ExistOnlyOne(inputSources) {
+		slog.Error("请仅指定 -addr, -in, 或 -url 中的一个")
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	// 初始化输出写入器
+	outChannel, closeOutput, err := InitOutputWriter(outputFileFlag, outputFormatFlag)
+	if err != nil {
+		slog.Error("初始化输出写入器失败", "error", err)
+		os.Exit(1)
+	}
+	defer closeOutput() // 确保资源释放
+	defer close(outChannel)
+
+	// 主机输入 channel 设置
+	var hostChan <-chan Host
+	switch {
+	case addressFlag != "":
+		hostChan = IterateAddr(addressFlag, enableIPv6Flag)
+	case inputFileFlag != "":
+		f, err := os.Open(inputFileFlag)
+		if err != nil {
+			slog.Error("打开输入文件错误", "path", inputFileFlag, "error", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		hostChan = Iterate(f, enableIPv6Flag)
+	case urlFlag != "":
+		slog.Info("从 URL 获取域名列表", "url", urlFlag)
+		resp, err := http.Get(urlFlag)
+		if err != nil {
+			slog.Error("HTTP 请求失败", "url", urlFlag, "error", err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		bodyBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			slog.Error("读取响应体失败", "url", urlFlag, "error", err)
+			os.Exit(1)
+		}
+		slog.Debug("URL 响应", "status", resp.StatusCode, "body_length", len(bodyBytes))
+
+		domainRegex := regexp.MustCompile(`(http|https)://(.*?)[/"<>\s]+`)
+		matches := domainRegex.FindAllStringSubmatch(string(bodyBytes), -1)
+		var domains []string
+		for _, match := range matches {
+			domains = append(domains, match[2])
+		}
+		domains = RemoveDuplicateStr(domains)
+		slog.Info("从 URL 解析域名", "count", len(domains))
+		hostChan = Iterate(strings.NewReader(strings.Join(domains, "\n")), enableIPv6Flag)
+	default:
+		slog.Error("未指定输入源")
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	geoData := NewGeo()
+
+	var wg sync.WaitGroup
+	wg.Add(threadFlag)
+
+	tlsSettings := TLSSettings{
+		Timeout:         timeoutFlag,
+		Port:            portFlag,
+		EnableIPv6:      enableIPv6Flag,
+		ChromeAutoHello: chromeAutoFlag,
+	}
+
+	slog.Info("开始 TLS 扫描", "threads", threadFlag, "timeout", timeoutFlag, "port", portFlag, "output", outputFileFlag, "format", outputFormatFlag)
+	startTime := time.Now()
+
+	for i := 0; i < threadFlag; i++ {
+		go func() {
+			defer wg.Done()
+			for host := range hostChan {
+				ScanTLS(host, outChannel, geoData, tlsSettings)
+			}
+		}()
+	}
+
+	wg.Wait()
+	elapsedTime := time.Since(startTime)
+	slog.Info("TLS 扫描完成", "耗时", elapsedTime.String())
 }

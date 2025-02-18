@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"net"
 	"strconv"
@@ -10,90 +11,143 @@ import (
 	utls "github.com/refraction-networking/utls"
 )
 
-func ScanTLS(host Host, out chan<- string, geo *Geo) {
-	if host.IP == nil {
-		ip, err := LookupIP(host.Origin)
+// TLSSettings 结构体封装了 TLS 配置参数。
+type TLSSettings struct {
+	Timeout         int
+	Port            int
+	EnableIPv6      bool
+	ChromeAutoHello bool
+}
+
+// ScanResult 结构体用于存储扫描结果，字段名更适合 JSON 输出。
+type ScanResult struct {
+	IP         string `json:"ip"`           // IP 地址，字符串格式
+	Origin     string `json:"origin"`       // 原始输入
+	Domain     string `json:"cert_domain"`  // 证书域名
+	Issuers    string `json:"cert_issuers"` // 证书颁发者
+	GeoCode    string `json:"geo_code"`     // 地理位置代码
+	Feasible   bool   `json:"feasible"`     // 是否可行 (符合 TLS 1.3 + h2)
+	TLSVersion string `json:"tls_version"`  // TLS 版本
+	ALPN       string `json:"alpn"`         // ALPN 协议
+}
+
+// ScanTLS 函数对指定主机执行 TLS 扫描。
+func ScanTLS(host Host, out chan<- ScanResult, geo *Geo, settings TLSSettings) {
+	if !host.IP.IsValid() {
+		ip, err := LookupIP(host.Origin, settings.EnableIPv6)
 		if err != nil {
-			slog.Debug("Failed to get IP from the origin", "origin", host.Origin, "err", err)
+			slog.Debug("获取域名 IP 地址失败", "origin", host.Origin, "错误", err)
 			return
 		}
 		host.IP = ip
 	}
 
-	hostPort := net.JoinHostPort(host.IP.String(), strconv.Itoa(port))
+	hostPort := net.JoinHostPort(host.IP.String(), strconv.Itoa(settings.Port))
 
-	conn, err := net.DialTimeout("tcp", hostPort, time.Duration(timeout)*time.Second)
+	conn, err := net.DialTimeout("tcp", hostPort, time.Duration(settings.Timeout)*time.Second)
 	if err != nil {
-		slog.Debug("Cannot dial", "target", hostPort)
+		slog.Debug("无法连接目标", "target", hostPort, "错误", err)
 		return
 	}
 	defer conn.Close()
 
-	err = conn.SetDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
-	if err != nil {
-		slog.Error("Error setting deadline", "err", err)
+	deadline := time.Now().Add(time.Duration(settings.Timeout) * time.Second)
+	if err := conn.SetDeadline(deadline); err != nil {
+		slog.Error("设置连接截止时间错误", "target", hostPort, "错误", err)
 		return
 	}
 
-	// 使用utls配置替换标准TLS配置
 	tlsCfg := &utls.Config{
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"h2", "http/1.1"},
 		CurvePreferences:   []utls.CurveID{utls.X25519},
+		ServerName:         host.Origin,
 	}
 
-	if host.Type == HostTypeDomain {
-		tlsCfg.ServerName = host.Origin
+	if host.Type != HostTypeDomain {
+		tlsCfg.ServerName = host.IP.String()
 	}
 
-	// 创建utls客户端并选择Chrome的指纹特征
-	clientHelloID := utls.HelloChrome_Auto // 自动选择最新Chrome版本
-	c := utls.UClient(conn, tlsCfg, clientHelloID)
-	defer c.Close()
+	var clientHelloID utls.ClientHelloID
+	if settings.ChromeAutoHello {
+		clientHelloID = utls.HelloChrome_Auto
+	} else {
+		clientHelloID = utls.HelloChrome_120
+	}
 
-	// 执行TLS握手
-	err = c.Handshake()
+	uConn := utls.UClient(conn, tlsCfg, clientHelloID)
+	defer uConn.Close()
+
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	err = uConn.HandshakeContext(ctx)
 	if err != nil {
-		slog.Debug("TLS handshake failed", "target", hostPort)
+		slog.Debug("TLS 握手失败", "target", hostPort, "错误", err)
 		return
 	}
 
-	state := c.ConnectionState()
+	state := uConn.ConnectionState()
 	alpn := state.NegotiatedProtocol
 	domain := ""
 	issuers := ""
+
 	if len(state.PeerCertificates) > 0 {
 		domain = state.PeerCertificates[0].Subject.CommonName
 		issuers = strings.Join(state.PeerCertificates[0].Issuer.Organization, " | ")
 	}
 
-	log := slog.Info
+	logLevel := slog.LevelInfo
 	feasible := true
-	geoCode := geo.GetGeo(host.IP)
+	geoCode := geo.GetGeoNetIP(host.IP)
 
 	if state.Version != utls.VersionTLS13 || alpn != "h2" || len(domain) == 0 || len(issuers) == 0 {
-		log = slog.Debug
+		logLevel = slog.LevelDebug
 		feasible = false
+		out <- ScanResult{
+			IP:         host.IP.String(), // 存储 IP 地址的字符串形式
+			Origin:     host.Origin,
+			Domain:     domain,
+			Issuers:    issuers,
+			GeoCode:    geoCode,
+			Feasible:   feasible,
+			TLSVersion: getTLSVersionName(state.Version),
+			ALPN:       alpn,
+		}
+		slog.Debug("ScanTLS: 发送不可行结果到 channel", "ip", host.IP.String()) // 添加 debug 日志
 	} else {
-		out <- strings.Join([]string{host.IP.String(), host.Origin, domain, "\"" + issuers + "\"", geoCode}, ",") + "\n"
+		// 发送 ScanResult 结构体到输出通道
+		out <- ScanResult{
+			IP:         host.IP.String(), // 存储 IP 地址的字符串形式
+			Origin:     host.Origin,
+			Domain:     domain,
+			Issuers:    issuers,
+			GeoCode:    geoCode,
+			Feasible:   feasible,
+			TLSVersion: getTLSVersionName(state.Version),
+			ALPN:       alpn,
+		}
+		slog.Debug("ScanTLS: 发送可行结果到 channel", "ip", host.IP.String()) // 添加 debug 日志
 	}
 
-	// 转换TLS版本号为标准名称
-	tlsVersion := "Unknown"
-	switch state.Version {
-	case utls.VersionTLS13:
-		tlsVersion = "TLS 1.3"
-	case utls.VersionTLS12:
-		tlsVersion = "TLS 1.2"
-	}
-
-	log("Connected to target",
+	slog.Log(context.Background(), logLevel, "连接到目标",
 		"feasible", feasible,
 		"ip", host.IP.String(),
 		"origin", host.Origin,
-		"tls", tlsVersion,
+		"tls", getTLSVersionName(state.Version),
 		"alpn", alpn,
 		"cert-domain", domain,
 		"cert-issuer", issuers,
 		"geo", geoCode)
+}
+
+// getTLSVersionName 函数将 uTLS 版本常量转换为字符串表示形式。
+func getTLSVersionName(version uint16) string {
+	switch version {
+	case utls.VersionTLS13:
+		return "TLS 1.3"
+	case utls.VersionTLS12:
+		return "TLS 1.2"
+	default:
+		return "Unknown"
+	}
 }
