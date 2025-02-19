@@ -10,7 +10,6 @@ import (
 	"math"
 	"net"
 	"net/netip"
-	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -96,7 +95,7 @@ func Iterate(reader io.Reader, enableIPv6 bool) <-chan Host {
 
 // ValidateDomainName uses regex to validate domain names.
 func ValidateDomainName(domain string) bool {
-	domainRegex := regexp.MustCompile(`(?m)^[A-Za-z0-9\-.]+$`)
+	domainRegex := regexp.MustCompile(`(?m)^[A-Za-z0-9\-.]+)`)
 	return domainRegex.MatchString(domain)
 }
 
@@ -200,90 +199,69 @@ func (a ByIP) Less(i, j int) bool {
 	return ip1.Less(ip2)
 }
 
-// OutWriterJSON creates output writer channel and writes JSON output.
-func OutWriterJSON(writer io.Writer) chan<- ScanResult {
+// OutWriter creates output writer channel and writes output based on format.
+func OutWriter(writer io.Writer, format string) chan<- ScanResult {
 	outputChan := make(chan ScanResult)
 	go func() {
-		defer slog.Info("JSON 输出写入器已关闭")
+		slog.Info(format + " 输出写入器启动")
 		bufWriter := bufio.NewWriter(writer)
 		defer func() {
+			slog.Debug(format + " 输出写入器 - 刷新缓冲区...")
 			if err := bufWriter.Flush(); err != nil {
-				slog.Error("刷新 JSON 输出缓冲区错误", "error", err)
+				slog.Error("刷新输出缓冲区错误", "format", format, "error", err)
 			}
-		}()
-
-		results := []ScanResult{}
-		for result := range outputChan {
-			slog.Debug("接收到结果", "result", result)
-			results = append(results, result)
-		}
-
-		// 排序结果
-		sort.Sort(ByIP(results))
-
-		// 编码为 JSON
-		encoder := json.NewEncoder(bufWriter)
-		encoder.SetIndent("", "  ")
-		if err := encoder.Encode(results); err != nil {
-			slog.Error("JSON 编码错误", "error", err)
-		}
-	}()
-	return outputChan
-}
-
-// OutWriterReadable creates output writer channel and writes human-readable output.
-func OutWriterReadable(writer io.Writer) chan<- ScanResult {
-	outputChan := make(chan ScanResult)
-	go func() {
-		defer slog.Info("易读文本输出写入器已关闭")
-		bufWriter := bufio.NewWriter(writer)
-		defer func() {
-			err := bufWriter.Flush()
-			if err != nil {
-				slog.Error("刷新易读文本输出缓冲区错误 (defer)", "error", err) // defer 中的 flush 也添加日志
-			} else {
-				slog.Debug("刷新易读文本输出缓冲区成功 (defer)") // defer 中的 flush 成功日志
-			}
+			slog.Info(format + " 输出写入器已关闭")
 		}()
 
 		var results []ScanResult
 		for result := range outputChan {
-			slog.Debug("OutWriterReadable 接收到结果", "ip", result.IP)
+			slog.Debug("OutWriter 接收到结果", "ip", result.IP, "format", format) // 添加 debug 日志
 			results = append(results, result)
 		}
-		sort.Sort(ByIP(results))
 
-		logWrite := func(s string) { // 定义一个内部函数，简化日志记录
-			_, err := bufWriter.WriteString(s)
-			if err != nil {
-				slog.Error("WriteString 错误", "error", err)
+		sort.Sort(ByIP(results)) // Sort results by IP address
+
+		switch format {
+		case "json":
+			slog.Debug("OutWriter - 开始 JSON 编码")
+			encoder := json.NewEncoder(bufWriter)
+			encoder.SetIndent("", " ") // 设置 JSON 缩进
+			if err := encoder.Encode(results); err != nil {
+				slog.Error("JSON 编码错误", "error", err) // 添加 debug 日志
 			} else {
-				slog.Debug("WriteString 成功", "content", strings.TrimSpace(s)) // 记录写入内容 (去除首尾空格)
+				slog.Debug("OutWriter - JSON 编码完成，准备写入文件") // 添加 debug 日志
 			}
-		}
+			slog.Debug("OutWriter - 刷新 JSON 缓冲区...")
+			if err := bufWriter.Flush(); err != nil { // 显式刷新 JSON 缓冲区
+				slog.Error("刷新 JSON 输出缓冲区错误", "error", err)
+			}
+			slog.Debug("OutWriter - JSON 缓冲区刷新完成")
 
-		logWrite("TLS 扫描结果:\n\n") // 使用 logWrite 写入总标题
+		case "readable":
+			slog.Debug("OutWriter - 开始写入易读文本")
+			_, _ = bufWriter.WriteString("TLS 扫描结果:\n\n") // 添加总标题
+			for _, res := range results {
+				_, _ = bufWriter.WriteString("------------------------------------\n")
+				_, _ = bufWriter.WriteString(fmt.Sprintf("IP 地址: %s\n", res.IP))
+				_, _ = bufWriter.WriteString(fmt.Sprintf("原始输入: %s\n", res.Origin))
+				_, _ = bufWriter.WriteString(fmt.Sprintf("证书域名: %s\n", res.Domain))
+				_, _ = bufWriter.WriteString(fmt.Sprintf("证书颁发者: %s\n", res.Issuers))
+				_, _ = bufWriter.WriteString(fmt.Sprintf("地理位置代码: %s\n", res.GeoCode))
+				_, _ = bufWriter.WriteString(fmt.Sprintf("是否可行: %t\n", res.Feasible))
+				_, _ = bufWriter.WriteString(fmt.Sprintf("TLS 版本: %s\n", res.TLSVersion))
+				_, _ = bufWriter.WriteString(fmt.Sprintf("ALPN 协议: %s\n", res.ALPN))
+				_, _ = bufWriter.WriteString("------------------------------------\n")
+			}
+			_, _ = bufWriter.WriteString("\n扫描完成，详细结果如上。\n") // 添加结尾语
+			slog.Debug("OutWriter - 易读文本写入完成，准备刷新缓冲区")
+			if err := bufWriter.Flush(); err != nil { // 显式刷新易读文本缓冲区
+				slog.Error("刷新易读文本输出缓冲区错误", "error", err)
+			}
+			slog.Debug("OutWriter - 易读文本缓冲区刷新完成")
 
-		for _, res := range results {
-			logWrite("------------------------------------\n")
-			logWrite(fmt.Sprintf("IP 地址:         %s\n", res.IP))
-			logWrite(fmt.Sprintf("原始输入:       %s\n", res.Origin))
-			logWrite(fmt.Sprintf("证书域名:       %s\n", res.Domain))
-			logWrite(fmt.Sprintf("证书颁发者:     %s\n", res.Issuers))
-			logWrite(fmt.Sprintf("地理位置代码:   %s\n", res.GeoCode))
-			logWrite(fmt.Sprintf("是否可行:       %t\n", res.Feasible))
-			logWrite(fmt.Sprintf("TLS 版本:       %s\n", res.TLSVersion))
-			logWrite(fmt.Sprintf("ALPN 协议:      %s\n", res.ALPN))
-			logWrite("------------------------------------\n")
+		default:
+			slog.Error("不支持的输出格式", "format", format)
 		}
-		logWrite("\n扫描完成，详细结果如上。\n") // 使用 logWrite 写入结尾语
-		err := bufWriter.Flush()     // 显式 Flush，并添加日志
-		if err != nil {
-			slog.Error("刷新易读文本输出缓冲区错误 (显式)", "error", err)
-		} else {
-			slog.Debug("刷新易读文本输出缓冲区成功 (显式)")
-		}
-		slog.Debug("易读文本输出完成，写入文件")
 	}()
 	return outputChan
 }
@@ -309,39 +287,4 @@ func NextIP(ip netip.Addr, increment bool) netip.Addr {
 		return parsedIP
 	}
 	return netip.Addr{}
-}
-
-// 初始化输出写入器
-func InitOutputWriter(outputFilePrefix, outputFormat string) (chan<- ScanResult, func(), error) {
-	var writer io.Writer
-	var closeFunc func() = func() {} // 默认空的关闭函数
-
-	if outputFilePrefix != "" {
-		var file *os.File
-		var err error
-		if outputFormat == "json" {
-			file, err = os.OpenFile(outputFilePrefix+".json", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0777)
-		} else if outputFormat == "readable" {
-			file, err = os.OpenFile(outputFilePrefix+".txt", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0777)
-		} else {
-			return nil, nil, fmt.Errorf("不支持的输出格式: %s", outputFormat)
-		}
-
-		if err != nil {
-			return nil, nil, fmt.Errorf("无法打开输出文件: %v", err)
-		}
-
-		writer = file
-		closeFunc = func() { file.Close() }
-	} else {
-		writer = os.Stdout // 默认输出到标准输出
-	}
-
-	if outputFormat == "json" {
-		return OutWriterJSON(writer), closeFunc, nil
-	} else if outputFormat == "readable" {
-		return OutWriterReadable(writer), closeFunc, nil
-	}
-
-	return nil, nil, fmt.Errorf("未知的输出格式: %s", outputFormat)
 }

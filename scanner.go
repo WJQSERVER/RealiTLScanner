@@ -32,7 +32,7 @@ type ScanResult struct {
 }
 
 // ScanTLS 函数对指定主机执行 TLS 扫描。
-func ScanTLS(host Host, out chan<- ScanResult, geo *Geo, settings TLSSettings) {
+func ScanTLS(host Host, outputFile *OutputFileWriter, geo *Geo, settings TLSSettings) { // 修改 out 参数类型
 	if !host.IP.IsValid() {
 		ip, err := LookupIP(host.Origin, settings.EnableIPv6)
 		if err != nil {
@@ -100,33 +100,24 @@ func ScanTLS(host Host, out chan<- ScanResult, geo *Geo, settings TLSSettings) {
 	feasible := true
 	geoCode := geo.GetGeoNetIP(host.IP)
 
+	scanResult := ScanResult{ // 创建 ScanResult 结构体
+		IP:         host.IP.String(),
+		Origin:     host.Origin,
+		Domain:     domain,
+		Issuers:    issuers,
+		GeoCode:    geoCode,
+		Feasible:   feasible,
+		TLSVersion: getTLSVersionName(state.Version),
+		ALPN:       alpn,
+	}
+
 	if state.Version != utls.VersionTLS13 || alpn != "h2" || len(domain) == 0 || len(issuers) == 0 {
 		logLevel = slog.LevelDebug
 		feasible = false
-		out <- ScanResult{
-			IP:         host.IP.String(), // 存储 IP 地址的字符串形式
-			Origin:     host.Origin,
-			Domain:     domain,
-			Issuers:    issuers,
-			GeoCode:    geoCode,
-			Feasible:   feasible,
-			TLSVersion: getTLSVersionName(state.Version),
-			ALPN:       alpn,
-		}
-		slog.Debug("ScanTLS: 发送不可行结果到 channel", "ip", host.IP.String()) // 添加 debug 日志
+		scanResult.Feasible = feasible // 确保 Feasible 字段被正确设置
+		outputFile.outFail(scanResult) // 调用 outFail 方法
 	} else {
-		// 发送 ScanResult 结构体到输出通道
-		out <- ScanResult{
-			IP:         host.IP.String(), // 存储 IP 地址的字符串形式
-			Origin:     host.Origin,
-			Domain:     domain,
-			Issuers:    issuers,
-			GeoCode:    geoCode,
-			Feasible:   feasible,
-			TLSVersion: getTLSVersionName(state.Version),
-			ALPN:       alpn,
-		}
-		slog.Debug("ScanTLS: 发送可行结果到 channel", "ip", host.IP.String()) // 添加 debug 日志
+		outputFile.outOK(scanResult) // 调用 outOK 方法
 	}
 
 	slog.Log(context.Background(), logLevel, "连接到目标",
